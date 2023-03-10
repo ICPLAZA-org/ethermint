@@ -1,3 +1,18 @@
+// Copyright 2021 Evmos Foundation
+// This file is part of Evmos' Ethermint library.
+//
+// The Ethermint library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The Ethermint library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the Ethermint library. If not, see https://github.com/evmos/ethermint/blob/main/LICENSE
 package eip712
 
 import (
@@ -7,37 +22,22 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
+	"time"
 
+	sdkmath "cosmossdk.io/math"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/ed25519"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 
+	errorsmod "cosmossdk.io/errors"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 )
-
-// ComputeTypedDataHash computes keccak hash of typed data for signing.
-func ComputeTypedDataHash(typedData apitypes.TypedData) ([]byte, error) {
-	domainSeparator, err := typedData.HashStruct("EIP712Domain", typedData.Domain.Map())
-	if err != nil {
-		err = sdkerrors.Wrap(err, "failed to pack and hash typedData EIP712Domain")
-		return nil, err
-	}
-
-	typedDataHash, err := typedData.HashStruct(typedData.PrimaryType, typedData.Message)
-	if err != nil {
-		err = sdkerrors.Wrap(err, "failed to pack and hash typedData primary type")
-		return nil, err
-	}
-
-	rawData := []byte(fmt.Sprintf("\x19\x01%s%s", string(domainSeparator), string(typedDataHash)))
-	return crypto.Keccak256(rawData), nil
-}
 
 // WrapTxToTypedData is an ultimate method that wraps Amino-encoded Cosmos Tx JSON data
 // into an EIP712-compatible TypedData request.
@@ -51,7 +51,7 @@ func WrapTxToTypedData(
 	txData := make(map[string]interface{})
 
 	if err := json.Unmarshal(data, &txData); err != nil {
-		return apitypes.TypedData{}, sdkerrors.Wrap(sdkerrors.ErrJSONUnmarshal, "failed to JSON unmarshal data")
+		return apitypes.TypedData{}, errorsmod.Wrap(errortypes.ErrJSONUnmarshal, "failed to JSON unmarshal data")
 	}
 
 	domain := apitypes.TypedDataDomain{
@@ -70,7 +70,7 @@ func WrapTxToTypedData(
 	if feeDelegation != nil {
 		feeInfo, ok := txData["fee"].(map[string]interface{})
 		if !ok {
-			return apitypes.TypedData{}, sdkerrors.Wrap(sdkerrors.ErrInvalidType, "cannot parse fee from tx data")
+			return apitypes.TypedData{}, errorsmod.Wrap(errortypes.ErrInvalidType, "cannot parse fee from tx data")
 		}
 
 		feeInfo["feePayer"] = feeDelegation.FeePayer.String()
@@ -203,7 +203,11 @@ func traverseFields(
 	}
 
 	for i := 0; i < n; i++ {
-		var field reflect.Value
+		var (
+			field reflect.Value
+			err   error
+		)
+
 		if v.IsValid() {
 			field = v.Field(i)
 		}
@@ -212,23 +216,15 @@ func traverseFields(
 		fieldName := jsonNameFromTag(t.Field(i).Tag)
 
 		if fieldType == cosmosAnyType {
-			any, ok := field.Interface().(*codectypes.Any)
-			if !ok {
-				return sdkerrors.Wrapf(sdkerrors.ErrPackAny, "%T", field.Interface())
+			// Unpack field, value as Any
+			if fieldType, field, err = unpackAny(cdc, field); err != nil {
+				return err
 			}
+		}
 
-			anyWrapper := &cosmosAnyWrapper{
-				Type: any.TypeUrl,
-			}
-
-			if err := cdc.UnpackAny(any, &anyWrapper.Value); err != nil {
-				return sdkerrors.Wrap(err, "failed to unpack Any in msg struct")
-			}
-
-			fieldType = reflect.TypeOf(anyWrapper)
-			field = reflect.ValueOf(anyWrapper)
-
-			// then continue as normal
+		// If field is an empty value, do not include in types, since it will not be present in the object
+		if field.IsZero() {
+			continue
 		}
 
 		for {
@@ -265,6 +261,12 @@ func traverseFields(
 			fieldType = fieldType.Elem()
 			field = field.Index(0)
 			isCollection = true
+
+			if fieldType == cosmosAnyType {
+				if fieldType, field, err = unpackAny(cdc, field); err != nil {
+					return err
+				}
+			}
 		}
 
 		for {
@@ -295,6 +297,11 @@ func traverseFields(
 
 		ethTyp := typToEth(fieldType)
 		if len(ethTyp) > 0 {
+			// Support array of uint64
+			if isCollection && fieldType.Kind() != reflect.Slice && fieldType.Kind() != reflect.Array {
+				ethTyp += "[]"
+			}
+
 			if prefix == typeDefPrefix {
 				typeMap[rootType] = append(typeMap[rootType], apitypes.Type{
 					Name: fieldName,
@@ -312,7 +319,6 @@ func traverseFields(
 		}
 
 		if fieldType.Kind() == reflect.Struct {
-
 			var fieldTypedef string
 
 			if isCollection {
@@ -351,6 +357,27 @@ func jsonNameFromTag(tag reflect.StructTag) string {
 	return parts[0]
 }
 
+// Unpack the given Any value with Type/Value deconstruction
+func unpackAny(cdc codectypes.AnyUnpacker, field reflect.Value) (reflect.Type, reflect.Value, error) {
+	any, ok := field.Interface().(*codectypes.Any)
+	if !ok {
+		return nil, reflect.Value{}, errorsmod.Wrapf(errortypes.ErrPackAny, "%T", field.Interface())
+	}
+
+	anyWrapper := &cosmosAnyWrapper{
+		Type: any.TypeUrl,
+	}
+
+	if err := cdc.UnpackAny(any, &anyWrapper.Value); err != nil {
+		return nil, reflect.Value{}, errorsmod.Wrap(err, "failed to unpack Any in msg struct")
+	}
+
+	fieldType := reflect.TypeOf(anyWrapper)
+	field = reflect.ValueOf(anyWrapper)
+
+	return fieldType, field, nil
+}
+
 // _.foo_bar.baz -> TypeFooBarBaz
 //
 // this is needed for Geth's own signing code which doesn't
@@ -379,8 +406,12 @@ var (
 	hashType      = reflect.TypeOf(common.Hash{})
 	addressType   = reflect.TypeOf(common.Address{})
 	bigIntType    = reflect.TypeOf(big.Int{})
-	cosmIntType   = reflect.TypeOf(sdk.Int{})
+	cosmIntType   = reflect.TypeOf(sdkmath.Int{})
+	cosmDecType   = reflect.TypeOf(sdk.Dec{})
 	cosmosAnyType = reflect.TypeOf(&codectypes.Any{})
+	timeType      = reflect.TypeOf(time.Time{})
+
+	edType = reflect.TypeOf(ed25519.PubKey{})
 )
 
 // typToEth supports only basic types and arrays of basic types.
@@ -425,6 +456,9 @@ func typToEth(typ reflect.Type) string {
 		}
 	case reflect.Ptr:
 		if typ.Elem().ConvertibleTo(bigIntType) ||
+			typ.Elem().ConvertibleTo(timeType) ||
+			typ.Elem().ConvertibleTo(edType) ||
+			typ.Elem().ConvertibleTo(cosmDecType) ||
 			typ.Elem().ConvertibleTo(cosmIntType) {
 			return str
 		}
@@ -432,6 +466,9 @@ func typToEth(typ reflect.Type) string {
 		if typ.ConvertibleTo(hashType) ||
 			typ.ConvertibleTo(addressType) ||
 			typ.ConvertibleTo(bigIntType) ||
+			typ.ConvertibleTo(edType) ||
+			typ.ConvertibleTo(timeType) ||
+			typ.ConvertibleTo(cosmDecType) ||
 			typ.ConvertibleTo(cosmIntType) {
 			return str
 		}
@@ -443,7 +480,7 @@ func typToEth(typ reflect.Type) string {
 func doRecover(err *error) {
 	if r := recover(); r != nil {
 		if e, ok := r.(error); ok {
-			e = sdkerrors.Wrap(e, "panicked with error")
+			e = errorsmod.Wrap(e, "panicked with error")
 			*err = e
 			return
 		}
